@@ -28,6 +28,21 @@ def test_cli_scan_download_and_json(fixture_site, settings, monkeypatch):
     assert result.exit_code==0,result.output
     assert '"status": "completed"' in result.output
 
+    # Test play command
+    opened = []
+    import subprocess
+    monkeypatch.setattr(subprocess, 'run', lambda cmd: opened.append(cmd))
+    monkeypatch.setattr(shutil, 'which', lambda x: '/usr/bin/xdg-open' if x == 'xdg-open' else None)
+    play_result = runner.invoke(app, ['play'])
+    assert play_result.exit_code == 0, play_result.output
+    assert 'Playing:' in play_result.output
+    assert len(opened) == 1
+
+    # Test play with unknown job ID
+    bad_play = runner.invoke(app, ['play', 'unknown-id'])
+    assert bad_play.exit_code != 0
+    assert 'Job not found' in bad_play.output
+
 
 @pytest.mark.skipif(shutil.which('ffmpeg') is None,reason='FFmpeg unavailable')
 @pytest.mark.asyncio

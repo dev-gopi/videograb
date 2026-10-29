@@ -8,7 +8,7 @@ import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from .config import Settings
 from .http import SafeHTTP
@@ -22,6 +22,11 @@ log = logging.getLogger(__name__)
 
 class SettingsUpdate(BaseModel):
     output_dir: str = Field(min_length=1, max_length=1024)
+
+
+class CreateDirRequest(BaseModel):
+    parent: str = Field(min_length=1, max_length=1024)
+    name: str = Field(min_length=1, max_length=128)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -127,6 +132,57 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(404, "Scan not found")
         return result
 
+    @app.get("/api/scans/{scan_id}/preview/{item_id}/{format_id}")
+    async def preview_media(scan_id: str, item_id: str, format_id: str, request: Request):
+        scan = storage.get_scan(scan_id)
+        if not scan:
+            raise HTTPException(404, "Scan not found")
+        item = next((i for i in scan.items if i.id == item_id), None)
+        if not item:
+            raise HTTPException(404, "Item not found in scan")
+        fmt = next((f for f in item.formats if f.id == format_id), None)
+        if not fmt:
+            raise HTTPException(404, "Format not found")
+
+        req_headers = {k: v for k, v in fmt.headers.items() if k.lower() in {"user-agent", "referer", "origin", "accept"}}
+        if "range" in request.headers:
+            req_headers["range"] = request.headers["range"]
+
+        try:
+            upstream_resp, final_url = await http.request(fmt.url, method="GET", headers=req_headers, stream=True)
+        except Exception as exc:
+            raise HTTPException(502, f"Failed to connect to stream: {exc}")
+
+        import mimetypes
+        content_type = upstream_resp.headers.get("content-type")
+        if not content_type or "octet-stream" in content_type:
+            content_type, _ = mimetypes.guess_type(final_url)
+            if not content_type:
+                content_type = "video/mp4"
+
+        forward_headers = {
+            "Content-Type": content_type,
+            "Accept-Ranges": "bytes",
+            "Content-Disposition": "inline",
+        }
+        for h in ("content-range", "content-length"):
+            if h in upstream_resp.headers:
+                forward_headers[h] = upstream_resp.headers[h]
+
+        async def stream_generator():
+            try:
+                async for chunk in upstream_resp.aiter_bytes(chunk_size=65536):
+                    yield chunk
+            finally:
+                await upstream_resp.aclose()
+
+        return StreamingResponse(
+            stream_generator(),
+            status_code=upstream_resp.status_code,
+            headers=forward_headers,
+            media_type=content_type,
+        )
+
     @app.post("/api/downloads", status_code=202)
     async def download(selection: DownloadRequest):
         try:
@@ -156,6 +212,66 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(404, "Job not found")
         return job
 
+    @app.get("/api/downloads/{job_id}/file")
+    async def media_file(job_id: str):
+        job = storage.get_job(job_id)
+        if not job:
+            raise HTTPException(404, "Job not found")
+        if not job.output_path:
+            raise HTTPException(404, "Download has no output file")
+        path = Path(job.output_path).resolve()
+        if not path.is_file():
+            raise HTTPException(404, "Downloaded file not found on disk")
+        import mimetypes
+        media_type, _ = mimetypes.guess_type(path.name)
+        if not media_type:
+            media_type = "audio/mpeg" if job.audio_only else "video/mp4"
+        return FileResponse(path, media_type=media_type, filename=path.name, content_disposition_type="inline")
+
+    @app.get("/api/downloads/{job_id}/stream")
+    async def media_stream(job_id: str):
+        return await media_file(job_id)
+
+    @app.get("/api/downloads/{job_id}/subtitles")
+    async def media_subtitles(job_id: str):
+        job = storage.get_job(job_id)
+        if not job or not job.output_path:
+            return {"subtitles": []}
+        path = Path(job.output_path).resolve()
+        if not path.is_file():
+            return {"subtitles": []}
+        subtitles = []
+        parent = path.parent
+        stem = path.stem
+        if parent.is_dir():
+            for sub_file in parent.glob(f"{stem}.*"):
+                if sub_file == path or not sub_file.is_file():
+                    continue
+                ext = sub_file.suffix.lower().lstrip(".")
+                if ext in {"vtt", "srt"}:
+                    parts = sub_file.name.split(".")
+                    lang = parts[-2] if len(parts) >= 3 else "sub"
+                    subtitles.append({
+                        "language": lang,
+                        "label": lang.upper(),
+                        "url": f"/api/downloads/{job_id}/subtitles/{sub_file.name}",
+                        "format": ext,
+                    })
+        return {"subtitles": subtitles}
+
+    @app.get("/api/downloads/{job_id}/subtitles/{filename}")
+    async def subtitle_file(job_id: str, filename: str):
+        job = storage.get_job(job_id)
+        if not job or not job.output_path:
+            raise HTTPException(404, "Job not found")
+        if "/" in filename or "\\" in filename or ".." in filename:
+            raise HTTPException(400, "Invalid subtitle filename")
+        path = (Path(job.output_path).parent / filename).resolve()
+        if not path.is_file():
+            raise HTTPException(404, "Subtitle file not found")
+        media_type = "text/vtt" if path.suffix.lower() == ".vtt" else "text/plain"
+        return FileResponse(path, media_type=media_type, filename=path.name, content_disposition_type="inline")
+
     @app.delete("/api/downloads/{job_id}", status_code=204)
     async def delete_history_item(job_id: str):
         job = storage.get_job(job_id)
@@ -168,6 +284,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.delete("/api/downloads")
     async def clear_history():
         return {"deleted": storage.clear_finished_jobs()}
+
+    @app.post("/api/downloads/{job_id}/open-folder")
+    async def open_download_folder(job_id: str):
+        job = storage.get_job(job_id)
+        if not job or not job.output_path:
+            raise HTTPException(404, "Download has no output file")
+        path = Path(job.output_path).resolve()
+        folder = path.parent
+        if not folder.is_dir():
+            raise HTTPException(404, "Directory does not exist")
+        import shutil, subprocess
+        opener = "xdg-open" if shutil.which("xdg-open") else ("open" if shutil.which("open") else None)
+        opened = False
+        if opener:
+            try:
+                subprocess.Popen([opener, str(folder)])
+                opened = True
+            except Exception:
+                opened = False
+        return {"opened": opened, "folder": str(folder)}
 
     @app.post("/api/downloads/{job_id}/{action}")
     async def control(job_id: str, action: str):
@@ -203,6 +339,91 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         settings.output_dir = path
         (settings.data_dir / "preferences.json").write_text(json.dumps({"output_dir": str(path)}), encoding="utf-8")
         return {"output_dir": str(path)}
+
+    @app.get("/api/fs/directories")
+    async def list_fs_directories(path: str | None = None):
+        target = Path(path).expanduser().resolve() if path else settings.output_dir.resolve()
+        if not target.is_dir():
+            target = settings.output_dir.resolve()
+            if not target.is_dir():
+                target = Path.home()
+        home = Path.home()
+        quick_links = [{"name": "Home", "path": str(home)}]
+        for name in ("Downloads", "Videos", "Movies", "Documents", "Music", "Desktop"):
+            cand = home / name
+            if cand.is_dir() and str(cand) not in [q["path"] for q in quick_links]:
+                quick_links.append({"name": name, "path": str(cand)})
+        if str(settings.output_dir) not in [q["path"] for q in quick_links] and settings.output_dir.is_dir():
+            quick_links.append({"name": "Current Output", "path": str(settings.output_dir)})
+
+        subdirs = []
+        try:
+            for entry in sorted(target.iterdir(), key=lambda x: x.name.lower()):
+                if entry.is_dir() and not entry.name.startswith("."):
+                    subdirs.append({"name": entry.name, "path": str(entry)})
+        except (PermissionError, OSError):
+            pass
+
+        return {
+            "current": str(target),
+            "parent": str(target.parent) if target.parent != target else None,
+            "subdirs": subdirs[:250],
+            "quick_links": quick_links,
+        }
+
+    @app.post("/api/fs/create-directory")
+    async def create_fs_directory(data: CreateDirRequest):
+        parent = Path(data.parent).expanduser().resolve()
+        if not parent.is_dir():
+            raise HTTPException(400, "Parent directory does not exist")
+        name = data.name.strip()
+        if "/" in name or "\\" in name or ".." in name or not name:
+            raise HTTPException(400, "Invalid directory name")
+        target = parent / name
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+            return {"path": str(target)}
+        except Exception as exc:
+            raise HTTPException(400, f"Could not create directory: {exc}") from exc
+
+    @app.post("/api/settings/browse-native")
+    async def browse_native_directory():
+        import os, shutil, subprocess
+        has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+        if not has_display:
+            return {"ok": False, "reason": "No display server available"}
+        zenity = shutil.which("zenity")
+        kdialog = shutil.which("kdialog")
+        chosen = None
+        if zenity:
+            try:
+                proc = await asyncio.to_thread(
+                    subprocess.run,
+                    [zenity, "--file-selection", "--directory", "--title=Select Download Directory", f"--filename={settings.output_dir}/"],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                if proc.returncode == 0 and proc.stdout.strip():
+                    chosen = proc.stdout.strip()
+            except Exception:
+                pass
+        elif kdialog:
+            try:
+                proc = await asyncio.to_thread(
+                    subprocess.run,
+                    [kdialog, "--getexistingdirectory", str(settings.output_dir)],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                if proc.returncode == 0 and proc.stdout.strip():
+                    chosen = proc.stdout.strip()
+            except Exception:
+                pass
+        if chosen and Path(chosen).is_dir():
+            return {"ok": True, "path": chosen}
+        return {"ok": False, "reason": "Native directory picker unavailable or cancelled"}
 
     return app
 

@@ -159,6 +159,36 @@ def jobs(json_output: bool = typer.Option(False, "--json")):
 
 
 @app.command()
+def play(job_id: Annotated[str | None, typer.Argument(help="Job ID to play; defaults to most recent completed job")] = None):
+    """Play or open a downloaded video in your default system media player."""
+    s = load_settings()
+    s.prepare()
+    jobs = Storage(s.database).list_jobs()
+    target_job = None
+    if job_id:
+        target_job = next((j for j in jobs if j.id == job_id), None)
+        if not target_job:
+            typer.echo(f"Job not found: {job_id}", err=True)
+            raise typer.Exit(1)
+    else:
+        target_job = next((j for j in jobs if j.status == "completed" and j.output_path), None)
+        if not target_job:
+            typer.echo("No completed downloads found to play.", err=True)
+            raise typer.Exit(1)
+    if not target_job.output_path or not Path(target_job.output_path).is_file():
+        typer.echo(f"Output file missing: {target_job.output_path}", err=True)
+        raise typer.Exit(1)
+    typer.echo(f"Playing: {target_job.title} -> {target_job.output_path}")
+    import subprocess
+    import shutil
+    opener = "xdg-open" if shutil.which("xdg-open") else ("open" if shutil.which("open") else None)
+    if opener:
+        subprocess.run([opener, target_job.output_path])
+    else:
+        typer.echo(f"Default opener unavailable. File is saved at: {target_job.output_path}")
+
+
+@app.command()
 def serve(host: str = typer.Option("127.0.0.1", help="Localhost binding only"),
           port: int = typer.Option(8765)):
     """Start local web UI at http://127.0.0.1:8765."""
